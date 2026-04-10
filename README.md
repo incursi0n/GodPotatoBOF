@@ -38,9 +38,7 @@ godpotato
 godpotato token
 godpotato help
 godpotato -cmd "cmd /c whoami /priv"
-godpotato -cmd "cmd /c dir"
 godpotato -cmd "cmd /c whoami" -pipe "mycustompipe"
-godpotato -cmd "cmd /c whoami" -pipe "token"
 ```
 
 Credits:
