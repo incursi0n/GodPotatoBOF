@@ -149,24 +149,13 @@ godpotato -cmd \"cmd /c whoami\" -pipe \"mycustompipe\"
     # Figure out the arch of this session
     $barch = barch($bid);
 
-    # Read in the right BOF file from the script directory, then fall back
-    # to the known-good absolute path used for manual inline-execute.
-    $path = script_resource("dist/BOF." . $barch . ".o");
-    $handle = openf($path);
-    if ($handle !is $null) {
-        $data = readb($handle, -1);
-        closef($handle);
-    }
+    # Read in the right BOF file from the 'dist' directory relative to this .cna file
+    $handle = openf(script_resource("dist/BOF. $+ $barch $+ .o"));
+    $data = readb($handle, -1);
+    closef($handle);
+
     if ($data is $null) {
-        $path = "/root/Desktop/Codidi/Potato/GodPotatoBOF/dist/BOF." . $barch . ".o";
-        $handle = openf($path);
-        if ($handle !is $null) {
-            $data = readb($handle, -1);
-            closef($handle);
-        }
-    }
-    if ($data is $null) {
-        berror($bid, "Failed to read BOF object: " . $path);
+        berror($bid, "Failed to read BOF object: " . script_resource("dist/BOF." . $barch . ".o"));
         return;
     }
 
